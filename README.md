@@ -1,2 +1,2 @@
-# bitcoinec
-BitcoinEC – Evolution Core implementation
+# bitcoinqe
+BitcoinQE Quantum Evolution Core implementation
