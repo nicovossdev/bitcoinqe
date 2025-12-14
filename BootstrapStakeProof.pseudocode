@@ -1,0 +1,244 @@
+// Pseudocode — BQE bootstrap stake-weight from BTC UTXO snapshot
+// StakeProof is two Bitcoin-like raw TX hex blobs: CommitTxHex + SpendTxHex.
+// CommitTx is provably non-spendable on BTC (fictive prevout). SpendTx authenticates the binding.
+// Consensus uses BTC-style script verification as a proof system, not as an on-chain spend.
+
+// --------------------
+// Consensus constants
+// --------------------
+
+CONSTANTS:
+  // Snapshot selection (BTC)
+  SNAPSHOT_MTP_THRESHOLD_UTC = "2025-12-31T23:59:59Z"
+
+  // Eligible BTC UTXOs (value bounds in satoshis)
+  MIN_UTXO_SATS = 10_000                 // 0.0001 BTC
+  MAX_UTXO_SATS = 5_000_000_000          // 50 BTC
+
+  // Script policy
+  MAX_SCRIPT_PUBKEY_BYTES = 80           // strict cap on serialized scriptPubKey length (bytes)
+
+  // StakeProof anti-DoS cap (binary size, not hex char count)
+  MAX_STAKEPROOF_BYTES = 512             // Serialize(CommitTx) + Serialize(SpendTx) <= 512
+
+  // Legacy bootstrap stake sunset (BQE)
+  LEGACY_STAKE_LIMIT_BLOCKS = 10_903     // reference: 2009-01-03 (1|09|03)
+
+  // PoS issuance activation (BQE)
+  POS_ACTIVATION_HEIGHT = 1              // tokens mint via PoS after genesis
+
+  // CommitTx fictive prevout pattern (provably not a real BTC spend)
+  FICTIVE_PREV_TXID = 0xFF repeated 32   // 32 bytes of 0xFF
+  FICTIVE_PREV_VOUT = 0xFFFFFFFF         // uint32 max
+
+  // CommitTx structure conventions (consensus simplification)
+  COMMIT_BINDING_VOUT_INDEX = 0          // output index that is "spent" by SpendTx
+  COMMIT_BINDING_VALUE_SATS = 0          // must be zero; CommitTx carries no value
+
+  // Supported BTC script types for the snapshot UTXO (broad legacy coverage; size cap filters heavy scripts)
+  SUPPORTED_SCRIPT_TYPES = {
+    "P2PK", "P2PKH", "P2SH", "P2WPKH", "P2WSH", "P2TR_KEYPATH"
+  }
+
+DATA TYPES:
+  Outpoint = (txid, vout)
+  StakeKey = bytes
+  StakeWeight = uint128
+
+  BTC_UTXO = {
+    outpoint: Outpoint,
+    amount_sats: uint64,
+    script_type: string,
+    script_pubkey: bytes
+  }
+
+  StakeProof = {
+    commit_tx_hex: string,               // raw tx hex, Bitcoin-like serialization
+    spend_tx_hex:  string                // raw tx hex, Bitcoin-like serialization
+  }
+
+  CommitPayload = {
+    // Minimal fields required to bind the proof to the snapshot and to a BQE stake key
+    magic: bytes,
+    version: uint16,
+    chain_id: bytes,
+    snapshot_block_hash: bytes,
+    btc_outpoint: Outpoint,
+    btc_script_pubkey: bytes,
+    bqe_stake_key: StakeKey
+  }
+
+// --------------------
+// Snapshot selection
+// --------------------
+
+FUNCTION FindSnapshotBlock(btc_chain):
+  // Return the first BTC block whose MedianTimePast reaches the threshold
+  for block in btc_chain.in_height_order():
+    if MedianTimePast(block) >= ParseUTC(SNAPSHOT_MTP_THRESHOLD_UTC):
+      return block
+  abort("SnapshotBlock not found")
+
+FUNCTION BuildSnapshotUTXOSet(btc_chain, snapshot_block):
+  // Implementation-defined: build BTC UTXO set at snapshot height
+  return UTXOSetAtHeight(btc_chain, snapshot_block.height)
+
+// --------------------
+// Eligibility filter
+// --------------------
+
+FUNCTION IsEligibleUTXO(utxo: BTC_UTXO):
+  if utxo.amount_sats < MIN_UTXO_SATS: return false
+  if utxo.amount_sats > MAX_UTXO_SATS: return false
+  if utxo.script_type not in SUPPORTED_SCRIPT_TYPES: return false
+  if LengthBytes(utxo.script_pubkey) > MAX_SCRIPT_PUBKEY_BYTES: return false
+  return true
+
+// --------------------
+// StakeProof parsing
+// --------------------
+
+FUNCTION DecodeStakeProof(proof: StakeProof):
+  commit = DecodeTxHex(proof.commit_tx_hex)
+  spend  = DecodeTxHex(proof.spend_tx_hex)
+  return (commit, spend)
+
+FUNCTION StakeProofByteSize(commit_tx, spend_tx):
+  return LengthBytes(Serialize(commit_tx)) + LengthBytes(Serialize(spend_tx))
+
+// --------------------
+// CommitTx validation
+// --------------------
+
+FUNCTION HasFictiveInput(commit_tx):
+  // Require at least one input to match the fixed fictive prevout pattern
+  for inp in commit_tx.inputs:
+    if inp.prev_txid == FICTIVE_PREV_TXID and inp.prev_vout == FICTIVE_PREV_VOUT:
+      return true
+  return false
+
+FUNCTION ExtractCommitPayload(commit_tx) -> CommitPayload or NONE:
+  // Consensus requires exactly one OP_RETURN payload matching the expected format.
+  // Parsing rules and payload layout are defined by the reference implementation.
+  payload_bytes = ExtractSingleOpReturn(commit_tx)
+  if payload_bytes == NONE: return NONE
+  payload = ParseCommitPayload(payload_bytes)
+  if payload == INVALID: return NONE
+  return payload
+
+FUNCTION VerifyCommitTx(commit_tx, snapshot_utxo: BTC_UTXO, snapshot_block_hash):
+  // Anti-DoS must be enforced at StakeProof level; this function checks structure/binding.
+  if not HasFictiveInput(commit_tx): return false
+
+  payload = ExtractCommitPayload(commit_tx)
+  if payload == NONE: return false
+
+  // Bind payload to the correct chain and snapshot anchor
+  if payload.snapshot_block_hash != snapshot_block_hash: return false
+
+  // Bind payload to the exact snapshot UTXO identity and lock script
+  if payload.btc_outpoint != snapshot_utxo.outpoint: return false
+  if payload.btc_script_pubkey != snapshot_utxo.script_pubkey: return false
+  if LengthBytes(payload.btc_script_pubkey) > MAX_SCRIPT_PUBKEY_BYTES: return false
+
+  // CommitTx must create a zero-value output locked to the BTC scriptPubKey
+  if commit_tx.outputs[COMMIT_BINDING_VOUT_INDEX].value_sats != COMMIT_BINDING_VALUE_SATS:
+    return false
+
+  if commit_tx.outputs[COMMIT_BINDING_VOUT_INDEX].script_pubkey != payload.btc_script_pubkey:
+    return false
+
+  return true
+
+// --------------------
+// SpendTx validation (BTC-style signature proof)
+// --------------------
+
+FUNCTION VerifySpendTx(spend_tx, commit_tx):
+  // SpendTx must spend CommitTx vout0
+  if spend_tx.inputs.length < 1: return false
+  if spend_tx.inputs[0].prev_txid != TxId(commit_tx): return false
+  if spend_tx.inputs[0].prev_vout != COMMIT_BINDING_VOUT_INDEX: return false
+  return true
+
+FUNCTION VerifyControlSignatureAgainstCommit(spend_tx, commit_tx):
+  // Verify BTC-style script satisfaction against CommitTx vout0.
+  // For segwit/taproot sighash, prev_value_sats is required and fixed at 0.
+  prev_script_pubkey = commit_tx.outputs[COMMIT_BINDING_VOUT_INDEX].script_pubkey
+  prev_value_sats    = COMMIT_BINDING_VALUE_SATS  // 0
+
+  return VerifyBitcoinSpendSignature(
+           prev_script_pubkey = prev_script_pubkey,
+           prev_value_sats    = prev_value_sats,
+           spend_tx           = spend_tx
+         )
+
+// --------------------
+// Stake weight mapping
+// --------------------
+
+FUNCTION StakeWeightFromUTXO(snapshot_utxo: BTC_UTXO):
+  // Deterministic mapping from BTC UTXO value to initial stake weight
+  return WeightFunction(snapshot_utxo.amount_sats)
+
+// --------------------
+// Main proof verification
+// --------------------
+
+FUNCTION VerifyStakeProof(proof: StakeProof, snapshot_utxo: BTC_UTXO, snapshot_block_hash):
+  (commit, spend) = DecodeStakeProof(proof)
+
+  // DoS cap (binary)
+  if StakeProofByteSize(commit, spend) > MAX_STAKEPROOF_BYTES: return false
+
+  // CommitTx must be structurally valid and bound to this snapshot UTXO
+  if not VerifyCommitTx(commit, snapshot_utxo, snapshot_block_hash): return false
+
+  // SpendTx must spend CommitTx vout0
+  if not VerifySpendTx(spend, commit): return false
+
+  // BTC-style control proof: signature must satisfy the lock script (as if spending it)
+  if not VerifyControlSignatureAgainstCommit(spend, commit): return false
+
+  // If all checks pass, the binding is accepted:
+  // snapshot_utxo.outpoint -> payload.bqe_stake_key
+  return true
+
+// --------------------
+// Genesis stake-state construction
+// --------------------
+
+FUNCTION BuildGenesisStakeState(btc_chain):
+  snapshot_block = FindSnapshotBlock(btc_chain)
+  snapshot_hash  = snapshot_block.hash
+  snapshot_utxos = BuildSnapshotUTXOSet(btc_chain, snapshot_block)
+
+  genesis_state = Map<StakeKey, StakeWeight>(default=0)
+  consumed_outpoints = Set<Outpoint>()
+
+  for each utxo in snapshot_utxos:
+    if not IsEligibleUTXO(utxo): continue
+    if utxo.outpoint in consumed_outpoints: continue
+
+    // StakeProofs are supplied externally; consensus only defines verification rules.
+    for each proof in StakeProofsReferencing(utxo.outpoint):
+      if VerifyStakeProof(proof, utxo, snapshot_hash):
+        payload = ExtractCommitPayload(DecodeTxHex(proof.commit_tx_hex))
+        genesis_state[payload.bqe_stake_key] += StakeWeightFromUTXO(utxo)
+        consumed_outpoints.add(utxo.outpoint)  // one binding per eligible outpoint
+        break
+
+  return (snapshot_hash, genesis_state)
+
+// --------------------
+// Legacy stake sunset + issuance
+// --------------------
+
+FUNCTION IsLegacyStakeActive(bqe_height):
+  return bqe_height < LEGACY_STAKE_LIMIT_BLOCKS
+
+CONSENSUS RULES (high level):
+  - Genesis MUST commit to: SnapshotBlockHash + GenesisStakeState (StakeKey -> StakeWeight)
+  - While IsLegacyStakeActive(height): validator power includes GenesisStakeState weights
+  - After LEGACY_STAKE_LIMIT_BLOCKS: GenesisStakeState weights MUST be ignored (sunset)
+  - No premine: BQE token supply changes only via PoS issuance at heights >= POS_ACTIVATION_HEIGHT
